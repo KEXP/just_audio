@@ -16,6 +16,43 @@
 
 // TODO: Check for and report invalid state transitions.
 // TODO: Apply Apple's guidance on seeking: https://developer.apple.com/library/archive/qa/qa1820/_index.html
+
+// TODO(KEXP): temporary HLS metadata logging (tag KEXP-HLS) for exploring what
+// the stream exposes. Remove once device verification is done.
+@interface AudioPlayer () <AVPlayerItemMetadataCollectorPushDelegate>
+@end
+
+static NSString *KEXPFourCC(FourCharCode code) {
+    char chars[5] = {
+        (char)((code >> 24) & 0xFF), (char)((code >> 16) & 0xFF),
+        (char)((code >> 8) & 0xFF), (char)(code & 0xFF), 0,
+    };
+    return [NSString stringWithFormat:@"'%s' (%u)", chars, (unsigned int)code];
+}
+
+// HLS packed audio carries the segment's MPEG-TS timestamp in an ID3 PRIV
+// frame owned by com.apple.streaming.transportStreamTimestamp: an 8-byte
+// big-endian 33-bit PTS in 90 kHz units.
+static NSString *KEXPDecodeTransportStreamTimestamp(AVMetadataItem *item) {
+    if (![item.value isKindOfClass:[NSData class]]) return nil;
+    NSData *data = (NSData *)item.value;
+    if (data.length != 8) return nil;
+    const uint8_t *bytes = data.bytes;
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++) value = (value << 8) | bytes[i];
+    uint64_t pts = value & 0x1FFFFFFFFULL;
+    return [NSString stringWithFormat:@"pts=%llu (%.3fs)", pts, pts / 90000.0];
+}
+
+static NSString *KEXPDescribeMetadataItem(AVMetadataItem *item) {
+    return [NSString stringWithFormat:
+        @"identifier=%@ key=%@ keySpace=%@ dataType=%@ valueClass=%@ value=%@ "
+        @"stringValue=%@ time=%.3f duration=%.3f startDate=%@ extraAttributes=%@",
+        item.identifier, item.key, item.keySpace, item.dataType,
+        NSStringFromClass([item.value class]), item.value, item.stringValue,
+        CMTimeGetSeconds(item.time), CMTimeGetSeconds(item.duration),
+        item.startDate, item.extraAttributes];
+}
 @implementation AudioPlayer {
     NSObject<FlutterPluginRegistrar>* _registrar;
     FlutterMethodChannel *_methodChannel;
@@ -51,6 +88,13 @@
     BOOL _justAdvanced;
     BOOL _enqueuedAll;
     NSDictionary<NSString *, NSObject *> *_icyMetadata;
+    // KEXP patch: last in-band title/url, and the indicated bitrate (bits/s)
+    // of the HLS variant currently playing.
+    NSDictionary<NSString *, NSObject *> *_icyInfo;
+    NSNumber *_hlsBitrate;
+    // KEXP patch: actual average audio bitrate (bits/s) from the access log.
+    // Reported in headers.metadataInterval, marked by headers.name.
+    NSNumber *_hlsActualBitrate;
     NSNumber *_errorCode;
     NSString *_errorMessage;
 }
@@ -404,6 +448,9 @@
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:playerItem];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemFailedToPlayToEndTimeNotification object:playerItem];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemPlaybackStalledNotification object:playerItem];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemNewAccessLogEntryNotification object:playerItem];
+    // TODO(KEXP): remove with the KEXP-HLS logging.
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemNewErrorLogEntryNotification object:playerItem];
 }
 
 - (void)addItemObservers:(AVPlayerItem *)playerItem {
@@ -420,6 +467,8 @@
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onFailToComplete:) name:AVPlayerItemFailedToPlayToEndTimeNotification object:playerItem];
     // Get notified when playback stalls (currently unused)
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onItemStalled:) name:AVPlayerItemPlaybackStalledNotification object:playerItem];
+    // KEXP patch: get notified when HLS switches variants, to report bitrate
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onNewAccessLogEntry:) name:AVPlayerItemNewAccessLogEntryNotification object:playerItem];
 
     AVPlayerItemMetadataOutput *metadataOutput = [[AVPlayerItemMetadataOutput alloc] initWithIdentifiers:nil];
     [metadataOutput setDelegate:self queue:dispatch_get_main_queue()];
@@ -428,6 +477,143 @@
     // TODO: Check this. Shouldn't need to removeOutput
     // later?
     [playerItem addOutput:metadataOutput];
+
+    // TODO(KEXP): remove with the KEXP-HLS logging.
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kexpOnNewErrorLogEntry:) name:AVPlayerItemNewErrorLogEntryNotification object:playerItem];
+    AVPlayerItemMetadataCollector *dateRangeCollector = [[AVPlayerItemMetadataCollector alloc] initWithIdentifiers:nil classifyingLabels:nil];
+    [dateRangeCollector setDelegate:self queue:dispatch_get_main_queue()];
+    [playerItem addMediaDataCollector:dateRangeCollector];
+    [self kexpLogAssetMetadata:playerItem.asset];
+}
+
+#pragma mark - KEXP-HLS logging (TODO(KEXP): remove once verification is done)
+
+// Stream-level metadata and the main playlist's variants (EXT-X-STREAM-INF).
+- (void)kexpLogAssetMetadata:(AVAsset *)asset {
+    NSString *url = [asset isKindOfClass:[AVURLAsset class]] ? ((AVURLAsset *)asset).URL.absoluteString : @"(not a URL asset)";
+    [asset loadValuesAsynchronouslyForKeys:@[@"metadata", @"availableMetadataFormats", @"duration", @"availableMediaCharacteristicsWithMediaSelectionOptions"] completionHandler:^{
+        NSLog(@"KEXP-HLS asset %@ duration=%.3f availableMetadataFormats=%@",
+              url, CMTimeGetSeconds(asset.duration), asset.availableMetadataFormats);
+        // Alternate renditions (EXT-X-MEDIA).
+        NSArray<AVMediaCharacteristic> *characteristics = asset.availableMediaCharacteristicsWithMediaSelectionOptions;
+        NSLog(@"KEXP-HLS media selection characteristics: %@", characteristics);
+        for (AVMediaCharacteristic characteristic in characteristics) {
+            AVMediaSelectionGroup *group = [asset mediaSelectionGroupForMediaCharacteristic:characteristic];
+            for (AVMediaSelectionOption *option in group.options) {
+                NSLog(@"KEXP-HLS media selection option [%@]: displayName=%@ mediaType=%@ language=%@ playable=%d metadata=%lu item(s)",
+                      characteristic, option.displayName, option.mediaType,
+                      option.extendedLanguageTag, option.playable,
+                      (unsigned long)option.commonMetadata.count);
+            }
+        }
+        for (AVMetadataItem *item in asset.metadata) {
+            NSLog(@"KEXP-HLS asset metadata: %@", KEXPDescribeMetadataItem(item));
+        }
+        for (AVMetadataFormat format in asset.availableMetadataFormats) {
+            for (AVMetadataItem *item in [asset metadataForFormat:format]) {
+                NSLog(@"KEXP-HLS asset metadata [%@]: %@", format, KEXPDescribeMetadataItem(item));
+            }
+        }
+    }];
+    if (@available(iOS 15.0, macOS 12.0, *)) {
+        if (![asset isKindOfClass:[AVURLAsset class]]) return;
+        AVURLAsset *urlAsset = (AVURLAsset *)asset;
+        [urlAsset loadValuesAsynchronouslyForKeys:@[@"variants"] completionHandler:^{
+            NSLog(@"KEXP-HLS %lu variant(s) in %@", (unsigned long)urlAsset.variants.count, url);
+            for (AVAssetVariant *variant in urlAsset.variants) {
+                NSMutableArray<NSString *> *formatIDs = [NSMutableArray new];
+                for (NSNumber *formatID in variant.audioAttributes.formatIDs) {
+                    [formatIDs addObject:KEXPFourCC(formatID.unsignedIntValue)];
+                }
+                NSLog(@"KEXP-HLS variant: peakBitRate=%.0f averageBitRate=%.0f audioFormatIDs=%@",
+                      variant.peakBitRate, variant.averageBitRate, formatIDs);
+            }
+        }];
+    }
+}
+
+// The decoded format of each track of the variant currently playing.
+- (void)kexpLogTracks:(AVPlayerItem *)playerItem {
+    NSLog(@"KEXP-HLS item currentDate=%@ currentTime=%.3f seekableTimeRanges=%@ preferredPeakBitRate=%.0f",
+          playerItem.currentDate, CMTimeGetSeconds(playerItem.currentTime),
+          playerItem.seekableTimeRanges, playerItem.preferredPeakBitRate);
+    if (@available(iOS 13.0, macOS 10.15, *)) {
+        NSLog(@"KEXP-HLS live offset: recommended=%.3f configured=%.3f automaticallyPreserves=%d",
+              CMTimeGetSeconds(playerItem.recommendedTimeOffsetFromLive),
+              CMTimeGetSeconds(playerItem.configuredTimeOffsetFromLive),
+              playerItem.automaticallyPreservesTimeOffsetFromLive);
+    }
+    for (AVPlayerItemTrack *track in playerItem.tracks) {
+        AVAssetTrack *assetTrack = track.assetTrack;
+        NSLog(@"KEXP-HLS track: enabled=%d mediaType=%@ trackID=%d estimatedDataRate=%.0f languageCode=%@",
+              track.enabled, assetTrack.mediaType, assetTrack.trackID,
+              assetTrack.estimatedDataRate, assetTrack.languageCode);
+        for (AVMetadataItem *item in assetTrack.metadata) {
+            NSLog(@"KEXP-HLS track metadata: %@", KEXPDescribeMetadataItem(item));
+        }
+        for (id description in assetTrack.formatDescriptions) {
+            CMFormatDescriptionRef format = (__bridge CMFormatDescriptionRef)description;
+            const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format);
+            if (asbd != NULL) {
+                NSLog(@"KEXP-HLS track format: formatID=%@ sampleRate=%.0f channels=%u framesPerPacket=%u",
+                      KEXPFourCC(asbd->mFormatID), asbd->mSampleRate,
+                      (unsigned int)asbd->mChannelsPerFrame, (unsigned int)asbd->mFramesPerPacket);
+            } else {
+                NSLog(@"KEXP-HLS track format: %@", description);
+            }
+        }
+    }
+}
+
+- (void)kexpLogAccessLogEvent:(AVPlayerItemAccessLogEvent *)e {
+    NSLog(@"KEXP-HLS access log: URI=%@ serverAddress=%@ serverAddressChanges=%ld "
+          @"playbackSessionID=%@ playbackType=%@ playbackStartDate=%@ playbackStartOffset=%.3f "
+          @"startupTime=%.3f indicatedBitrate=%.0f indicatedAverageBitrate=%.0f "
+          @"switchBitrate=%.0f observedBitrate=%.0f observedMinBitrate=%.0f "
+          @"observedMaxBitrate=%.0f observedBitrateStdDev=%.0f averageAudioBitrate=%.0f "
+          @"mediaRequests=%ld mediaRequestsWWAN=%ld bytesTransferred=%lld "
+          @"transferDuration=%.3f segmentsDownloadedDuration=%.3f durationWatched=%.3f "
+          @"stalls=%ld downloadOverdue=%ld",
+          e.URI, e.serverAddress, (long)e.numberOfServerAddressChanges,
+          e.playbackSessionID, e.playbackType, e.playbackStartDate, e.playbackStartOffset,
+          e.startupTime, e.indicatedBitrate, e.indicatedAverageBitrate,
+          e.switchBitrate, e.observedBitrate, e.observedMinBitrate,
+          e.observedMaxBitrate, e.observedBitrateStandardDeviation, e.averageAudioBitrate,
+          (long)e.numberOfMediaRequests, (long)e.mediaRequestsWWAN, e.numberOfBytesTransferred,
+          e.transferDuration, e.segmentsDownloadedDuration, e.durationWatched,
+          (long)e.numberOfStalls, (long)e.downloadOverdue);
+}
+
+- (void)kexpOnNewErrorLogEntry:(NSNotification *)notification {
+    AVPlayerItem *playerItem = (AVPlayerItem *)notification.object;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVPlayerItemErrorLogEvent *e = playerItem.errorLog.events.lastObject;
+        if (e == nil) return;
+        NSLog(@"KEXP-HLS error log: date=%@ URI=%@ serverAddress=%@ playbackSessionID=%@ "
+              @"statusCode=%ld domain=%@ comment=%@",
+              e.date, e.URI, e.serverAddress, e.playbackSessionID,
+              (long)e.errorStatusCode, e.errorDomain, e.errorComment);
+    });
+}
+
+// EXT-X-DATERANGE tags in the media playlist.
+- (void)metadataCollector:(AVPlayerItemMetadataCollector *)metadataCollector
+    didCollectDateRangeMetadataGroups:(NSArray<AVDateRangeMetadataGroup *> *)metadataGroups
+                   indexesOfNewGroups:(NSIndexSet *)indexesOfNewGroups
+              indexesOfModifiedGroups:(NSIndexSet *)indexesOfModifiedGroups {
+    void (^logGroup)(AVDateRangeMetadataGroup *, NSString *) = ^(AVDateRangeMetadataGroup *group, NSString *kind) {
+        NSLog(@"KEXP-HLS date range (%@): startDate=%@ endDate=%@ items=%lu",
+              kind, group.startDate, group.endDate, (unsigned long)group.items.count);
+        for (AVMetadataItem *item in group.items) {
+            NSLog(@"KEXP-HLS date range item: %@", KEXPDescribeMetadataItem(item));
+        }
+    };
+    [indexesOfNewGroups enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+        logGroup(metadataGroups[idx], @"new");
+    }];
+    [indexesOfModifiedGroups enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+        logGroup(metadataGroups[idx], @"modified");
+    }];
 }
 
 - (void)metadataOutput:(AVPlayerItemMetadataOutput *)output didOutputTimedMetadataGroups:(NSArray<AVTimedMetadataGroup *> *)groups fromPlayerItemTrack:(AVPlayerItemTrack *)track {
@@ -435,28 +621,111 @@
     BOOL hasIcyData = NO;
     NSString *title = (NSString *)[NSNull null];
     NSString *url = (NSString *)[NSNull null];
+    // KEXP patch: HLS packed audio carries title/artist as ID3 frames, which
+    // upstream drops. Map them into icyMetadata like an ICY StreamTitle.
+    NSString *id3Title = nil;
+    NSString *id3Artist = nil;
+    NSString *id3Url = nil;
     for (int i = 0; i < groups.count; i++) {
         AVTimedMetadataGroup *group = groups[i];
         for (int j = 0; j < group.items.count; j++) {
             AVMetadataItem *item = group.items[j];
+            // TODO(KEXP): remove once device verification is done.
+            NSLog(@"KEXP-HLS timed metadata (group %.3f+%.3f): %@",
+                  CMTimeGetSeconds(group.timeRange.start),
+                  CMTimeGetSeconds(group.timeRange.duration),
+                  KEXPDescribeMetadataItem(item));
+            NSString *transportStreamTimestamp = KEXPDecodeTransportStreamTimestamp(item);
+            if (transportStreamTimestamp != nil) {
+                NSLog(@"KEXP-HLS timed metadata PRIV transport stream timestamp: %@", transportStreamTimestamp);
+            }
             if ([@"icy/StreamTitle" isEqualToString:item.identifier]) {
                 hasIcyData = YES;
                 title = (NSString *)item.value;
             } else if ([@"icy/StreamUrl" isEqualToString:item.identifier]) {
                 hasIcyData = YES;
                 url = (NSString *)item.value;
+            } else if ([@"id3/TIT2" isEqualToString:item.identifier]) {
+                id3Title = item.stringValue;
+            } else if ([@"id3/TPE1" isEqualToString:item.identifier]) {
+                id3Artist = item.stringValue;
+            } else if ([@"id3/WXXX" isEqualToString:item.identifier]) {
+                id3Url = item.stringValue;
             }
         }
     }
-    if (hasIcyData) {
-        _icyMetadata = @{
-            @"info": @{
-                @"title": title,
-                @"url": url,
-            },
-        };
-        [self broadcastPlaybackEvent];
+    if (!hasIcyData && (id3Title != nil || id3Artist != nil)) {
+        hasIcyData = YES;
+        title = (id3Title != nil && id3Artist != nil)
+            ? [NSString stringWithFormat:@"%@ - %@", id3Artist, id3Title]
+            : (id3Title != nil ? id3Title : id3Artist);
+        if (id3Url != nil) url = id3Url;
     }
+    // KEXP patch: the current access log entry's average audio bitrate keeps
+    // changing without a notification, so refresh it on each segment's metadata.
+    BOOL actualChanged = [self refreshActualBitrate:_player.currentItem];
+    if (hasIcyData) {
+        _icyInfo = @{
+            @"title": title,
+            @"url": url,
+        };
+        [self updateIcyMetadata];
+    } else if (actualChanged) {
+        [self updateIcyMetadata];
+    }
+}
+
+// KEXP patch: returns YES if the actual bitrate changed.
+- (BOOL)refreshActualBitrate:(AVPlayerItem *)playerItem {
+    AVPlayerItemAccessLogEvent *event = playerItem.accessLog.events.lastObject;
+    if (event == nil || event.averageAudioBitrate <= 0) return NO;
+    NSNumber *actual = @((long long)event.averageAudioBitrate);
+    if (_hlsActualBitrate != nil && [actual isEqualToNumber:_hlsActualBitrate]) return NO;
+    _hlsActualBitrate = actual;
+    return YES;
+}
+
+// KEXP patch: HLS has no ICY headers, so report the indicated bitrate of the
+// variant being played as headers.bitrate, and the access log's average audio
+// bitrate as headers.metadataInterval.
+- (void)onNewAccessLogEntry:(NSNotification *)notification {
+    AVPlayerItem *playerItem = (AVPlayerItem *)notification.object;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVPlayerItemAccessLogEvent *event = playerItem.accessLog.events.lastObject;
+        // TODO(KEXP): remove with the KEXP-HLS logging.
+        if (event != nil) [self kexpLogAccessLogEvent:event];
+        NSData *extendedLog = playerItem.accessLog.extendedLogData;
+        if (extendedLog != nil) {
+            NSString *text = [[NSString alloc] initWithData:extendedLog encoding:playerItem.accessLog.extendedLogDataStringEncoding];
+            NSLog(@"KEXP-HLS extended access log:\n%@", text);
+        }
+        [self kexpLogTracks:playerItem];
+        BOOL changed = [self refreshActualBitrate:playerItem];
+        if (event != nil && event.indicatedBitrate > 0) {
+            NSNumber *bitrate = @((long long)event.indicatedBitrate);
+            if (self->_hlsBitrate == nil || ![bitrate isEqualToNumber:self->_hlsBitrate]) {
+                self->_hlsBitrate = bitrate;
+                changed = YES;
+            }
+        }
+        if (changed) [self updateIcyMetadata];
+    });
+}
+
+- (void)updateIcyMetadata {
+    NSMutableDictionary<NSString *, NSObject *> *metadata = [NSMutableDictionary new];
+    if (_icyInfo != nil) metadata[@"info"] = _icyInfo;
+    if (_hlsBitrate != nil || _hlsActualBitrate != nil) {
+        // Synthetic headers for HLS. metadataInterval is unused on HLS, so it
+        // carries the actual bitrate; name marks these headers as synthetic.
+        NSMutableDictionary<NSString *, NSObject *> *headers = [NSMutableDictionary new];
+        if (_hlsBitrate != nil) headers[@"bitrate"] = _hlsBitrate;
+        if (_hlsActualBitrate != nil) headers[@"metadataInterval"] = _hlsActualBitrate;
+        headers[@"name"] = @"kexp-hls";
+        metadata[@"headers"] = headers;
+    }
+    _icyMetadata = metadata;
+    [self broadcastPlaybackEvent];
 }
 
 - (NSMutableArray<AudioSource *> *)decodeAudioSources:(NSArray *)data {
