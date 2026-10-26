@@ -1,8 +1,19 @@
 # KEXP patch of just_audio 0.10.6
 
-Local copy of [just_audio 0.10.6](https://pub.dev/packages/just_audio/versions/0.10.6)
-(the `example/` folder is omitted), used via `dependency_overrides` in the app's
-`pubspec.yaml`.
+Fork of [ryanheise/just_audio](https://github.com/ryanheise/just_audio) based on
+the [0.10.6](https://pub.dev/packages/just_audio/versions/0.10.6) release. Only
+the `just_audio/` package is patched; `just_audio_platform_interface/` and
+`just_audio_web/` are unmodified. The KEXP app uses it as a git dependency in
+`dependency_overrides` in its `pubspec.yaml`:
+
+```yaml
+dependency_overrides:
+  just_audio:
+    git:
+      url: https://github.com/KEXP/just_audio.git
+      ref: kexp/0.10.6
+      path: just_audio
+```
 
 ## Why
 
@@ -14,10 +25,10 @@ song changes from the stream without polling.
 
 ## Changes
 
-- `android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java`,
+- `just_audio/android/src/main/java/com/ryanheise/just_audio/AudioPlayer.java`,
   `onMetadata`: handle `TextInformationFrame` (`TIT2`/`TPE1`) and
   `UrlLinkFrame`.
-- `darwin/just_audio/Sources/just_audio/AudioPlayer.m`,
+- `just_audio/darwin/just_audio/Sources/just_audio/AudioPlayer.m`,
   `metadataOutput:didOutputTimedMetadataGroups:fromPlayerItemTrack:`: accept
   `id3/TIT2`, `id3/TPE1`, `id3/WXXX`.
 
@@ -58,5 +69,15 @@ Lines marked `TODO(KEXP)` are temporary verification logging, tagged
 
 ## Upgrading just_audio
 
-Copy the new version from the pub cache over this folder (without `example/`),
-then re-apply the two changes above.
+1. Fetch upstream and create `kexp/<new-version>` from the commit released as
+   `<new-version>`.
+2. Cherry-pick or rebase the KEXP commits onto it, resolving conflicts in the
+   two files above.
+3. Push the branch, update `ref:` in the app's `pubspec.yaml`, run
+   `flutter pub get`, and commit the updated `pubspec.lock`.
+4. Run `test/unit/services/just_audio_patch_test.dart` in the app. It fails if
+   the patch was lost.
+
+When you switch from the branch to a tag, change ref: kexp/0.10.6 to the tag 
+in the intro snippet, and in step 3 tag <new-version>-kexp.1 instead of just 
+pushing the branch.                                                                                                                                                              
