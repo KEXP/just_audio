@@ -51,9 +51,6 @@ import androidx.media3.exoplayer.source.SilenceMediaSource; // Deprecated
 import androidx.media3.common.TrackGroup;
 import androidx.media3.exoplayer.dash.DashMediaSource; // Deprecated
 import androidx.media3.exoplayer.hls.HlsMediaSource; // Deprecated
-import androidx.media3.exoplayer.hls.HlsManifest;
-import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist;
-import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist;
 import androidx.media3.exoplayer.source.LoadEventInfo;
 import androidx.media3.exoplayer.source.MediaLoadData;
 import androidx.media3.exoplayer.trackselection.TrackSelectionArray;
@@ -110,11 +107,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     // headers.metadataInterval, marked by headers.name == KEXP_HLS_HEADERS_NAME.
     private Integer hlsActualBitrate;
     private static final String KEXP_HLS_HEADERS_NAME = "kexp-hls";
-    // TODO(KEXP): state for the temporary KEXP-HLS logging.
-    private static final String KEXP_TAG = "KEXP-HLS";
-    private HlsMultivariantPlaylist kexpLoggedMultivariant;
-    private boolean kexpLoggedMediaTags;
-    private long kexpLastLoggedSegment = -1;
     private AudioAttributes pendingAudioAttributes;
     private LoadControl loadControl;
     private boolean offloadSchedulingEnabled;
@@ -273,8 +265,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         String id3Url = null;
         for (int i = 0; i < metadata.length(); i++) {
             final Metadata.Entry entry = metadata.get(i);
-            // TODO(KEXP): remove once device verification is done.
-            Log.d(KEXP_TAG, "onMetadata " + entry.getClass().getSimpleName() + ": " + entry);
             if (entry instanceof IcyInfo) {
                 icyInfo = (IcyInfo) entry;
                 broadcastImmediatePlaybackEvent();
@@ -349,7 +339,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onTimelineChanged(Timeline timeline, int reason) {
-        kexpLogManifest(); // TODO(KEXP): remove with the KEXP-HLS logging.
         if (updateCurrentIndex()) {
             broadcastImmediatePlaybackEvent();
         }
@@ -854,39 +843,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             player.addAnalyticsListener(new AnalyticsListener() {
                 @Override
                 public void onAudioInputFormatChanged(EventTime eventTime, Format format, DecoderReuseEvaluation decoderReuseEvaluation) {
-                    Log.d(KEXP_TAG, "audio input format: " + kexpDescribeFormat(format)); // TODO(KEXP)
                     if (format.bitrate == Format.NO_VALUE) return;
                     if (hlsBitrate != null && hlsBitrate == format.bitrate) return;
                     hlsBitrate = format.bitrate;
                     broadcastImmediatePlaybackEvent();
                 }
 
-                // TODO(KEXP): everything below is temporary KEXP-HLS logging.
-                @Override
-                public void onTracksChanged(EventTime eventTime, Tracks tracks) {
-                    for (int i = 0; i < tracks.getGroups().size(); i++) {
-                        Tracks.Group group = tracks.getGroups().get(i);
-                        Log.d(KEXP_TAG, "track group " + i + ": type=" + group.getType()
-                                + " adaptive=" + group.isAdaptiveSupported() + " selected=" + group.isSelected());
-                        for (int j = 0; j < group.length; j++) {
-                            Log.d(KEXP_TAG, "  track " + j + ": selected=" + group.isTrackSelected(j)
-                                    + " supported=" + group.isTrackSupported(j) + " "
-                                    + kexpDescribeFormat(group.getTrackFormat(j)));
-                        }
-                    }
-                }
-
-                @Override
-                public void onDownstreamFormatChanged(EventTime eventTime, MediaLoadData mediaLoadData) {
-                    Log.d(KEXP_TAG, "downstream format: reason=" + mediaLoadData.trackSelectionReason
-                            + " dataType=" + mediaLoadData.dataType + " "
-                            + kexpDescribeFormat(mediaLoadData.trackFormat));
-                }
-
                 @Override
                 public void onLoadCompleted(EventTime eventTime, LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData) {
-                    if (mediaLoadData.trackFormat == null) return;
-                    Log.d(KEXP_TAG, "load completed: trackBitrate=" + mediaLoadData.trackFormat.bitrate); // TODO(KEXP)
                     // KEXP patch: actual bitrate of each media segment.
                     if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return;
                     if (mediaLoadData.mediaStartTimeMs == C.TIME_UNSET || mediaLoadData.mediaEndTimeMs == C.TIME_UNSET) return;
@@ -897,87 +861,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     hlsActualBitrate = actual;
                     broadcastImmediatePlaybackEvent();
                 }
-
-                @Override
-                public void onLoadError(EventTime eventTime, LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData, IOException error, boolean wasCanceled) {
-                    Log.d(KEXP_TAG, "load error: uri=" + loadEventInfo.uri + " canceled=" + wasCanceled + " error=" + error);
-                }
-
-                @Override
-                public void onBandwidthEstimate(EventTime eventTime, int totalLoadTimeMs, long totalBytesLoaded, long bitrateEstimate) {
-                    Log.d(KEXP_TAG, "bandwidth estimate: " + bitrateEstimate + " bits/s (last " + totalBytesLoaded
-                            + " bytes in " + totalLoadTimeMs + " ms)");
-                }
-
-                @Override
-                public void onAudioDecoderInitialized(EventTime eventTime, String decoderName, long initializedTimestampMs, long initializationDurationMs) {
-                    Log.d(KEXP_TAG, "audio decoder: " + decoderName);
-                }
-
-                @Override
-                public void onPlayerError(EventTime eventTime, PlaybackException error) {
-                    Log.d(KEXP_TAG, "player error: " + error.getErrorCodeName() + " " + error);
-                }
             });
         }
-    }
-
-    // TODO(KEXP): temporary KEXP-HLS logging of the parsed HLS playlists.
-    // The multivariant playlist and the media playlist's raw tags are logged
-    // once; on each live refresh only the newly added segments are logged.
-    private void kexpLogManifest() {
-        if (player == null) return;
-        final Object manifest = player.getCurrentManifest();
-        if (!(manifest instanceof HlsManifest)) return;
-        final HlsManifest hls = (HlsManifest) manifest;
-
-        if (hls.multivariantPlaylist != kexpLoggedMultivariant) {
-            kexpLoggedMultivariant = hls.multivariantPlaylist;
-            kexpLoggedMediaTags = false;
-            kexpLastLoggedSegment = -1;
-            final HlsMultivariantPlaylist mv = hls.multivariantPlaylist;
-            Log.d(KEXP_TAG, "multivariant playlist: " + mv.baseUri);
-            for (String tag : mv.tags) Log.d(KEXP_TAG, "  tag: " + tag);
-            for (HlsMultivariantPlaylist.Variant v : mv.variants) {
-                Log.d(KEXP_TAG, "  variant: " + v.url + " " + kexpDescribeFormat(v.format));
-            }
-            for (HlsMultivariantPlaylist.Rendition r : mv.audios) {
-                Log.d(KEXP_TAG, "  audio rendition: " + r.name + " group=" + r.groupId + " url=" + r.url
-                        + " " + kexpDescribeFormat(r.format));
-            }
-        }
-
-        final HlsMediaPlaylist mp = hls.mediaPlaylist;
-        if (!kexpLoggedMediaTags) {
-            kexpLoggedMediaTags = true;
-            Log.d(KEXP_TAG, "media playlist: " + mp.baseUri + " version=" + mp.version
-                    + " mediaSequence=" + mp.mediaSequence + " targetDurationUs=" + mp.targetDurationUs
-                    + " startTimeUs=" + mp.startTimeUs + " hasProgramDateTime=" + mp.hasProgramDateTime
-                    + " durationUs=" + mp.durationUs + " holdBackUs=" + mp.serverControl.holdBackUs
-                    + " hasEndTag=" + mp.hasEndTag);
-            for (String tag : mp.tags) Log.d(KEXP_TAG, "  tag: " + tag);
-        }
-        for (int i = 0; i < mp.segments.size(); i++) {
-            final long sequence = mp.mediaSequence + i;
-            if (sequence <= kexpLastLoggedSegment) continue;
-            kexpLastLoggedSegment = sequence;
-            final HlsMediaPlaylist.Segment seg = mp.segments.get(i);
-            final String programDateTime = mp.hasProgramDateTime
-                    ? new java.util.Date((mp.startTimeUs + seg.relativeStartTimeUs) / 1000).toString()
-                    : "-";
-            Log.d(KEXP_TAG, "segment " + sequence + ": durationUs=" + seg.durationUs
-                    + " programDateTime=" + programDateTime + " title=" + seg.title + " url=" + seg.url);
-        }
-        Log.d(KEXP_TAG, "live offset ms=" + player.getCurrentLiveOffset()
-                + " isLive=" + player.isCurrentMediaItemLive());
-    }
-
-    private static String kexpDescribeFormat(Format f) {
-        if (f == null) return "format=null";
-        return "id=" + f.id + " mime=" + f.sampleMimeType + " container=" + f.containerMimeType
-                + " codecs=" + f.codecs + " bitrate=" + f.bitrate + " avg=" + f.averageBitrate
-                + " peak=" + f.peakBitrate + " sampleRate=" + f.sampleRate + " channels=" + f.channelCount
-                + " label=" + f.label + " language=" + f.language + " metadata=" + f.metadata;
     }
 
     private void setAudioAttributes(int contentType, int flags, int usage) {

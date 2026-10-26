@@ -11,9 +11,13 @@ dependency_overrides:
   just_audio:
     git:
       url: https://github.com/KEXP/just_audio.git
-      ref: kexp/0.10.6
+      ref: 0.10.6-kexp.2
       path: just_audio
 ```
+
+Releases are tagged `<upstream-version>-kexp.<n>` on the `kexp/<upstream-version>`
+branch. Never move a tag: for each change, commit to the branch, tag the next
+`<n>`, push the tag (`git push origin <tag>`), and update `ref:` in the app.
 
 ## Why
 
@@ -55,17 +59,8 @@ Both platforms also report the **actual** bitrate (bits/s) in
 Reusing `metadataInterval` avoids changing `just_audio_platform_interface`;
 replace it with a real field before anything user-facing depends on it.
 
-Lines marked `TODO(KEXP)` are temporary verification logging, tagged
-`KEXP-HLS` on both platforms:
-
-- Android: ID3 entries, the parsed multivariant and media playlists (raw tags,
-  variants, and each new segment's `#EXTINF` title and program date time),
-  live offset, track groups, format changes, loads, bandwidth estimates,
-  decoder and errors.
-- iOS: timed metadata (with the PRIV transport stream timestamp decoded),
-  asset metadata, variants, media selection options, `EXT-X-DATERANGE`
-  groups, access log entries and the extended access log, error log entries,
-  live offset, and track formats and metadata.
+`0.10.6-kexp.1` also included temporary `KEXP-HLS` verification logging, which
+later releases remove.
 
 ## Upgrading just_audio
 
@@ -73,8 +68,9 @@ Lines marked `TODO(KEXP)` are temporary verification logging, tagged
    `<new-version>`.
 2. Cherry-pick or rebase the KEXP commits onto it, resolving conflicts in the
    two files above.
-3. Push the branch, update `ref:` in the app's `pubspec.yaml`, run
-   `flutter pub get`, and commit the updated `pubspec.lock`.
+3. Push the branch, tag `<new-version>-kexp.1` and push the tag, then set
+   `ref:` in the app's `pubspec.yaml` to the tag, run `flutter pub get`, and
+   commit the updated `pubspec.lock`.
 4. Run `test/unit/services/just_audio_patch_test.dart` in the app. It fails if
    the patch was lost.
 
