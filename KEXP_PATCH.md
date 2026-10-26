@@ -78,6 +78,3 @@ Lines marked `TODO(KEXP)` are temporary verification logging, tagged
 4. Run `test/unit/services/just_audio_patch_test.dart` in the app. It fails if
    the patch was lost.
 
-When you switch from the branch to a tag, change ref: kexp/0.10.6 to the tag 
-in the intro snippet, and in step 3 tag <new-version>-kexp.1 instead of just 
-pushing the branch.                                                                                                                                                              
